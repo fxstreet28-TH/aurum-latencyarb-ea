@@ -37,7 +37,7 @@
 //|  Uses [Common]\Files\ — all 4 MT5 terminals must run on same VPS |
 //+------------------------------------------------------------------+
 #property copyright "AURUM TECH"
-#property version   "1.30"
+#property version   "1.31"
 #property strict
 #property description "Latency arb V4.3 - Multi-broker A consensus (Tickmill+Pepperstone+IC Markets → GOC)"
 #property description "Requires MT5 in HEDGING mode for B. All 4 terminals on same VPS (LD4)."
@@ -201,8 +201,24 @@ input bool           InpShowHeartbeat     = true;
 input int            InpFreezeAlertMs     = 2000;
 input int            InpBigSpreadPts      = 100;
 
+// NOTE: keep this group LAST so existing .set files stay aligned.
+input group "=== Telemetry (dashboard) ==="
+input bool   InpTelemetryEnabled  = true;
+input string InpDeploymentId      = "v43-01";   // must match on both A and B
+input string InpTelemetryUrl      = "https://aurum-trading-dashboard.vercel.app/api/events";
+input string InpIngestKey         = "ZcAoWOoOHX9ZwgPeTRMLab4VeImFTvIu";
+input string InpVpsHost           = "";      // fill in on attach
+input int    InpVpsPort           = 0;       // fill in on attach
+input int    InpHeartbeatSec      = 30;
+input int    InpTelemetryFlushSec = 5;
+input int    InpLagTimeoutMs      = 3000;
+
 //=================== CONSTANTS =====================================
 #define MAGIC              20260730
+#define EA_VERSION         "4.3"
+#define TEL_QUEUE_CAP      200
+#define TEL_BATCH_MAX      20
+#define A_STALE_RELAY_MS   300000   // stop relaying A heartbeat after 5 min stale
 #define HB_FILE_A1         "aurum_a1_hb.csv"
 #define HB_FILE_A2         "aurum_a2_hb.csv"
 #define HB_FILE_A3         "aurum_a3_hb.csv"
@@ -286,6 +302,88 @@ long     g_b_hb_updates              = 0;
 long     g_b_hb_updates_last_summary = 0;
 long     g_b_hb_last_msc_seen        = 0;
 
+//=================== TELEMETRY / OBSERVABILITY (V4.3 port) =========
+// Extended A-heartbeat cache (columns 6-9 of the CSV — identity fields).
+// Filled by ReadHeartbeatFromFile; "" / 0 when reading an old 5-column file.
+double   g_a1_spread = 0.0;  string g_a1_broker = "";  long g_a1_login = 0;  string g_a1_symbol = "";  long g_a1_tick = 0;
+double   g_a2_spread = 0.0;  string g_a2_broker = "";  long g_a2_login = 0;  string g_a2_symbol = "";  long g_a2_tick = 0;
+double   g_a3_spread = 0.0;  string g_a3_broker = "";  long g_a3_login = 0;  string g_a3_symbol = "";  long g_a3_tick = 0;
+
+// B: ATR(M1,14) handle for b_atr_m1_pts (created once in OnInit)
+int      g_atr_handle = INVALID_HANDLE;
+
+// B: telemetry queue (JSON event strings). Ring buffer, cap TEL_QUEUE_CAP.
+string   g_tel_q[];
+long     g_tel_last_hb_ms    = 0;   // last heartbeat enqueue (NowMs)
+long     g_tel_last_flush_ms = 0;   // last flush attempt (NowMs)
+
+// B: ab_lag measurement (one shot per cycle). measured=false => JSON null.
+bool     g_lag_active   = false;    // measurement window open
+bool     g_lag_measured = false;    // reached target before timeout
+bool     g_lag_is_buy   = false;    // B chases up (buy) or down (sell)
+double   g_lag_target   = 0.0;      // a_mid B must reach
+long     g_lag_t_a      = 0;        // A's stamped timestamp at signal (GetTickCount64 of A)
+long     g_lag_start_ms = 0;        // NowMs at signal (timeout base)
+long     g_lag_ms       = 0;        // measured t_b - t_a
+
+// B: per-cycle telemetry — captured from signal fire through close.
+// V4.3 is single-leg only: no hedge fields here — they are emitted as JSON
+// null (and final_state as "SINGLE_LEG") in BuildCycleJson().
+struct CycleTelemetry
+{
+   bool   active;
+   long   t_signal;
+   string direction;                // BUY | SELL (first/only leg)
+   double a_delta_pts;
+   int    a_brokers_agreed;
+   double a_price_at_signal;
+   double b_price_at_signal;
+   double b_spread_pts_at_signal;
+   string opened_at_iso;
+   string session;
+   double b_atr_m1_pts;
+   // leg1 (the only leg in V4.3)
+   long   t_leg1_fill;
+   ulong  leg1_ticket;
+   double leg1_expected_price;
+   double leg1_actual_price;
+   double leg1_slippage_pts;
+   // close
+   long   t_close;
+   string exit_reason;
+   string final_state;
+   double gross_pts;
+   double net_pts;
+   double net_money;
+};
+CycleTelemetry g_cyc;
+
+void ResetCycleTelemetry()
+{
+   g_cyc.active                 = false;
+   g_cyc.t_signal               = 0;
+   g_cyc.direction              = "";
+   g_cyc.a_delta_pts            = 0.0;
+   g_cyc.a_brokers_agreed       = 0;
+   g_cyc.a_price_at_signal      = 0.0;
+   g_cyc.b_price_at_signal      = 0.0;
+   g_cyc.b_spread_pts_at_signal = 0.0;
+   g_cyc.opened_at_iso          = "";
+   g_cyc.session                = "";
+   g_cyc.b_atr_m1_pts           = 0.0;
+   g_cyc.t_leg1_fill            = 0;
+   g_cyc.leg1_ticket            = 0;
+   g_cyc.leg1_expected_price    = 0.0;
+   g_cyc.leg1_actual_price      = 0.0;
+   g_cyc.leg1_slippage_pts      = 0.0;
+   g_cyc.t_close                = 0;
+   g_cyc.exit_reason            = "";
+   g_cyc.final_state            = "";
+   g_cyc.gross_pts              = 0.0;
+   g_cyc.net_pts                = 0.0;
+   g_cyc.net_money              = 0.0;
+}
+
 //+------------------------------------------------------------------+
 string Sanitize(string s)
 {
@@ -299,9 +397,91 @@ string Sanitize(string s)
    return out;
 }
 
+// Monotonic ms since system boot. Same clock on every terminal on this VPS,
+// so A and B timestamps are directly comparable. This is the ONLY clock used
+// for latency, cooldowns, ages and durations.
 long NowMs()
 {
-   return (long)TimeCurrent() * 1000 + (long)(GetTickCount64() % 1000);
+   return (long)GetTickCount64();
+}
+
+// Wall-clock, ISO 8601 UTC, e.g. "2026-07-27T09:14:32.000Z".
+// Used ONLY for the human-readable opened_at field sent to the DB — never for
+// latency/duration math (that is NowMs()).
+string IsoUtcNow()
+{
+   datetime t = TimeGMT();
+   MqlDateTime d; TimeToStruct(t, d);
+   return StringFormat("%04d-%02d-%02dT%02d:%02d:%02d.000Z",
+                       d.year, d.mon, d.day, d.hour, d.min, d.sec);
+}
+
+// Trading session bucket from GMT hour (dashboard context field).
+string SessionFromGmt()
+{
+   MqlDateTime d; TimeToStruct(TimeGMT(), d);
+   int h = d.hour;
+   if(h >= 0  && h < 7)  return "ASIA";
+   if(h >= 7  && h < 12) return "LONDON";
+   if(h >= 12 && h < 16) return "LONDON_NY_OVERLAP";
+   if(h >= 16 && h < 21) return "NY";
+   return "ASIA";  // 21-24
+}
+
+// B's ATR(M1,14) in points. 0.0 if handle/data not ready.
+double CurrentAtrM1Pts()
+{
+   if(g_atr_handle == INVALID_HANDLE) return 0.0;
+   double buf[];
+   if(CopyBuffer(g_atr_handle, 0, 0, 1, buf) < 1) return 0.0;
+   if(!MathIsValidNumber(buf[0])) return 0.0;
+   return buf[0] / _Point;
+}
+
+// JSON string escaper (handles the chars that would break a JSON string).
+string JsonEsc(string s)
+{
+   string out = "";
+   int n = StringLen(s);
+   for(int i = 0; i < n; i++)
+   {
+      ushort c = StringGetCharacter(s, i);
+      if(c == '\\')      out += "\\\\";
+      else if(c == '"')  out += "\\\"";
+      else if(c == '\n') out += "\\n";
+      else if(c == '\r') out += "\\r";
+      else if(c == '\t') out += "\\t";
+      else               out += ShortToString(c);
+   }
+   return out;
+}
+
+// Serialize a double as a JSON number (2 dp), or "null" if inf/nan.
+string JDbl(double v)
+{
+   if(!MathIsValidNumber(v)) return "null";
+   return DoubleToString(v, 2);
+}
+
+// Net money (account currency) realized on a position, from deal history.
+double PositionNetMoney(ulong ticket)
+{
+   if(ticket == 0) return 0.0;
+   double money = 0.0;
+   if(HistorySelectByPosition(ticket))
+   {
+      int deals = HistoryDealsTotal();
+      for(int i = 0; i < deals; i++)
+      {
+         ulong dt = HistoryDealGetTicket(i);
+         if(dt == 0) continue;
+         if(HistoryDealGetInteger(dt, DEAL_POSITION_ID) != (long)ticket) continue;
+         money += HistoryDealGetDouble(dt, DEAL_PROFIT)
+                + HistoryDealGetDouble(dt, DEAL_SWAP)
+                + HistoryDealGetDouble(dt, DEAL_COMMISSION);
+      }
+   }
+   return money;
 }
 
 // Return heartbeat filename for this role
@@ -326,33 +506,54 @@ string RoleTag(ENUM_ROLE r)
 //+------------------------------------------------------------------+
 //| Heartbeat I/O                                                     |
 //+------------------------------------------------------------------+
+// CSV columns (9): now_ms, bid, ask, digits, spread_pts, broker, login, symbol, tick_count
+// The last 4 are appended so B can relay A's identity to the dashboard. broker
+// is Sanitize()d so a comma in the company name cannot break the CSV.
 bool WriteHeartbeatToFile(string fname, double bid, double ask)
 {
    int flags = FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_COMMON|FILE_SHARE_READ|FILE_SHARE_WRITE;
    int h = FileOpen(fname, flags, ',');
    if(h == INVALID_HANDLE) return(false);
    double spread_pts = (ask - bid) / _Point;
+   string broker = Sanitize(AccountInfoString(ACCOUNT_COMPANY));
+   long   login  = AccountInfoInteger(ACCOUNT_LOGIN);
    FileWrite(h,
       (string)NowMs(),
       DoubleToString(bid, _Digits), DoubleToString(ask, _Digits),
-      (string)_Digits, DoubleToString(spread_pts, 1));
+      (string)_Digits, DoubleToString(spread_pts, 1),
+      broker, (string)login, _Symbol, (string)g_count);
    FileFlush(h); FileClose(h);
    return(true);
 }
 
-bool ReadHeartbeatFromFile(string fname, long &out_msc, double &out_bid, double &out_ask)
+// Reads the 9-column heartbeat. Tolerates the old 5-column format: the extra
+// out params come back "" / 0 and the call still succeeds (no error).
+bool ReadHeartbeatFromFile(string fname, long &out_msc, double &out_bid, double &out_ask,
+                           double &out_spread, string &out_broker, long &out_login,
+                           string &out_symbol, long &out_tick)
 {
    int flags = FILE_READ|FILE_CSV|FILE_ANSI|FILE_COMMON|FILE_SHARE_READ|FILE_SHARE_WRITE;
    int h = FileOpen(fname, flags, ',');
    if(h == INVALID_HANDLE) return(false);
-   string s_msc = FileReadString(h);
-   string s_bid = FileReadString(h);
-   string s_ask = FileReadString(h);
+   string s_msc    = FileReadString(h);   // 1
+   string s_bid    = FileReadString(h);   // 2
+   string s_ask    = FileReadString(h);   // 3
+   string s_digits = FileReadString(h);   // 4 (consumed, not needed)
+   string s_spread = FileReadString(h);   // 5
+   string s_broker = FileReadString(h);   // 6 (new)
+   string s_login  = FileReadString(h);   // 7 (new)
+   string s_symbol = FileReadString(h);   // 8 (new)
+   string s_tick   = FileReadString(h);   // 9 (new)
    FileClose(h);
    if(StringLen(s_msc) == 0 || StringLen(s_bid) == 0) return(false);
-   out_msc = StringToInteger(s_msc);
-   out_bid = StringToDouble(s_bid);
-   out_ask = StringToDouble(s_ask);
+   out_msc    = StringToInteger(s_msc);
+   out_bid    = StringToDouble(s_bid);
+   out_ask    = StringToDouble(s_ask);
+   out_spread = (StringLen(s_spread) > 0) ? StringToDouble(s_spread) : (out_ask - out_bid) / _Point;
+   out_broker = s_broker;                                                // "" on old format
+   out_login  = (StringLen(s_login) > 0) ? StringToInteger(s_login) : 0; // 0  on old format
+   out_symbol = s_symbol;                                                // "" on old format
+   out_tick   = (StringLen(s_tick)  > 0) ? StringToInteger(s_tick)  : 0; // 0  on old format
    return(true);
 }
 
@@ -384,6 +585,11 @@ void OpenPosition(string action, double lots)
                   action, InpSlPts, current_spread_pts, stops_level);
       return;
    }
+
+   // Expected fill = the price we would pay/receive at market, captured the
+   // instant BEFORE the order is sent (basis for leg1 slippage telemetry).
+   double expected_price = (action == ACTION_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
+                                                  : SymbolInfoDouble(_Symbol, SYMBOL_BID);
 
    // Send MARKET order WITHOUT SL/TP first — we'll modify after we know actual fill price
    bool ok = false;
@@ -423,6 +629,8 @@ void OpenPosition(string action, double lots)
       // continue anyway — position is open with no SL yet, timeout will backstop
    }
 
+   long now = NowMs();
+
    g_b_pos_open        = true;
    g_b_pos_action      = action;
    g_b_pos_ticket      = ticket;
@@ -430,9 +638,25 @@ void OpenPosition(string action, double lots)
    g_b_pos_sl_price    = sl_price;
    g_b_pos_tp_price    = 0.0;
    g_b_pos_tp_armed    = false;
-   g_b_pos_open_msc    = NowMs();
-   g_b_last_exec_msc   = NowMs();
+   g_b_pos_open_msc    = now;
+   g_b_last_exec_msc   = now;
    g_b_exec_count++;
+
+   // --- Telemetry: leg1 fill (signed slippage = disadvantage direction) ---
+   g_cyc.t_leg1_fill         = now;
+   g_cyc.leg1_ticket         = ticket;
+   g_cyc.leg1_expected_price = expected_price;
+   g_cyc.leg1_actual_price   = actual_entry;
+   g_cyc.leg1_slippage_pts   = (action == ACTION_BUY)
+                               ? (actual_entry - expected_price) / point   // paid more = worse
+                               : (expected_price - actual_entry) / point;  // sold lower = worse
+   g_cyc.active = true;   // real trade opened → this cycle will emit telemetry
+
+   // Open the ab_lag measurement window (timeout measured from t_signal).
+   g_lag_active   = true;
+   g_lag_measured = false;
+   g_lag_ms       = 0;
+   g_lag_start_ms = g_cyc.t_signal;
 
    PrintFormat("[B] OPEN %s ticket=%I64u lots=%.2f entry=%.*f SL=%.*f  (TP deferred until breakeven)",
                action, ticket, lots, digits, actual_entry, digits, sl_price);
@@ -473,6 +697,9 @@ void ClosePosition(string reason)
       PrintFormat("[B] CLOSE %s reason=%s pnl=%.1f pts duration=%I64d ms ticket=%I64u",
                   action, reason, pnl_pts, duration, ticket);
       TG_OrderClose(action, reason, pnl_pts, duration, ticket);
+      // --- Telemetry: EA-initiated close (V4.3 only ever calls this for TIMEOUT).
+      //     net_pts is the SAME value the EA logs above, so telemetry cannot diverge.
+      FinalizeCycleTelemetry(reason, "SINGLE_LEG", pnl_pts);
    }
    else
    {
@@ -540,6 +767,10 @@ void MonitorPosition()
       PrintFormat("[B] BROKER CLOSED %s reason=%s pnl=%.1f pts duration=%I64d ms ticket=%I64u",
                   closed_action, reason, pnl_pts_est, duration, closed_ticket);
       TG_OrderClose(closed_action, reason, pnl_pts_est, duration, closed_ticket);
+      // --- Telemetry: broker closed the position (SL/TP hit, stopout, etc.).
+      //     exit_reason is the raw V4.3 reason (SL_HIT / TP_HIT / TIMEOUT-independent);
+      //     net_pts matches the pnl the EA logs above.
+      FinalizeCycleTelemetry(reason, "SINGLE_LEG", pnl_pts_est);
       return;
    }
 
@@ -659,15 +890,20 @@ void ExecutorConsensusCheck()
       return;
 
    // 1. Read all 3 A heartbeats (any may be missing)
-   g_a1_ok = ReadHeartbeatFromFile(HB_FILE_A1, g_a1_msc, g_a1_bid, g_a1_ask);
-   g_a2_ok = ReadHeartbeatFromFile(HB_FILE_A2, g_a2_msc, g_a2_bid, g_a2_ask);
-   g_a3_ok = ReadHeartbeatFromFile(HB_FILE_A3, g_a3_msc, g_a3_bid, g_a3_ask);
+   g_a1_ok = ReadHeartbeatFromFile(HB_FILE_A1, g_a1_msc, g_a1_bid, g_a1_ask,
+                                   g_a1_spread, g_a1_broker, g_a1_login, g_a1_symbol, g_a1_tick);
+   g_a2_ok = ReadHeartbeatFromFile(HB_FILE_A2, g_a2_msc, g_a2_bid, g_a2_ask,
+                                   g_a2_spread, g_a2_broker, g_a2_login, g_a2_symbol, g_a2_tick);
+   g_a3_ok = ReadHeartbeatFromFile(HB_FILE_A3, g_a3_msc, g_a3_bid, g_a3_ask,
+                                   g_a3_spread, g_a3_broker, g_a3_login, g_a3_symbol, g_a3_tick);
 
-   // 2. Freshness — mark stale/missing brokers as inactive (do NOT block)
+   // 2. Freshness — mark stale/missing brokers as inactive (do NOT block).
+   //    age >= 0 rejects a future/garbage timestamp (was one-sided before).
    long now = NowMs();
-   bool a1_active = g_a1_ok && (now - g_a1_msc) <= InpMaxHeartbeatAgeMs;
-   bool a2_active = g_a2_ok && (now - g_a2_msc) <= InpMaxHeartbeatAgeMs;
-   bool a3_active = g_a3_ok && (now - g_a3_msc) <= InpMaxHeartbeatAgeMs;
+   long age1 = now - g_a1_msc, age2 = now - g_a2_msc, age3 = now - g_a3_msc;
+   bool a1_active = g_a1_ok && age1 >= 0 && age1 <= InpMaxHeartbeatAgeMs;
+   bool a2_active = g_a2_ok && age2 >= 0 && age2 <= InpMaxHeartbeatAgeMs;
+   bool a3_active = g_a3_ok && age3 >= 0 && age3 <= InpMaxHeartbeatAgeMs;
 
    int active_count = (a1_active ? 1 : 0) + (a2_active ? 1 : 0) + (a3_active ? 1 : 0);
 
@@ -818,7 +1054,272 @@ void ExecutorConsensusCheck()
       PrintFormat("[B] REVERSED: %s -> %s", action, exec_action);
    }
 
+   // --- Telemetry: capture signal context (g_cyc.active is set later, only if
+   //     the position actually opens, inside OpenPosition). ---
+   //     ab_lag chases the A price in the SIGNAL direction (feed lead, not the
+   //     executed trade), so g_lag_is_buy follows `action`, not `exec_action`.
+   double a_mid_target = b_mid + consensus_delta * point;   // A price B must chase to
+   long   t_a = 0;                                          // freshest active A timestamp
+   if(a1_active && g_a1_msc > t_a) t_a = g_a1_msc;
+   if(a2_active && g_a2_msc > t_a) t_a = g_a2_msc;
+   if(a3_active && g_a3_msc > t_a) t_a = g_a3_msc;
+
+   ResetCycleTelemetry();
+   g_cyc.t_signal               = g_b_last_signal_msc;
+   g_cyc.direction              = exec_action;              // BUY | SELL (leg actually opened)
+   g_cyc.a_delta_pts            = consensus_delta;
+   g_cyc.a_brokers_agreed       = agree;
+   g_cyc.a_price_at_signal      = a_mid_target;
+   g_cyc.b_price_at_signal      = b_mid;
+   g_cyc.b_spread_pts_at_signal = (b_ask - b_bid) / point;
+   g_cyc.opened_at_iso          = IsoUtcNow();
+   g_cyc.session                = SessionFromGmt();
+   g_cyc.b_atr_m1_pts           = CurrentAtrM1Pts();
+
+   // ab_lag targets (window is armed in OpenPosition on successful fill).
+   g_lag_is_buy = (action == ACTION_BUY);
+   g_lag_target = a_mid_target;
+   g_lag_t_a    = t_a;
+
    OpenPosition(exec_action, InpLots);
+}
+
+//+------------------------------------------------------------------+
+//| TELEMETRY ENGINE (B executor only)                                |
+//|                                                                   |
+//| Transport rules (hot-path safe):                                  |
+//|   - OnTick NEVER calls WebRequest. It only enqueues JSON strings. |
+//|   - WebRequest happens ONLY in OnTimer -> TelemetryFlush, and     |
+//|     ONLY while flat (g_b_pos_open == false — V4.3 has no cycle    |
+//|     state machine, so "flat" is the single-leg equivalent of      |
+//|     V4.4b's CYCLE_IDLE).                                          |
+//|   - A watchers never send HTTP (they only write the heartbeat).   |
+//+------------------------------------------------------------------+
+
+// Called every B tick from OnTick. Pure measurement — no HTTP, no trading.
+void UpdateLagMeasurement()
+{
+   if(!g_lag_active) return;
+   long now = NowMs();
+   if(now - g_lag_start_ms > InpLagTimeoutMs)
+   {
+      g_lag_active = false;   // timed out → g_lag_measured stays false → JSON null
+      return;
+   }
+   double b_bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double b_ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double b_mid = (b_bid + b_ask) * 0.5;
+   bool reached = g_lag_is_buy ? (b_mid >= g_lag_target) : (b_mid <= g_lag_target);
+   if(reached)
+   {
+      g_lag_ms       = now - g_lag_t_a;   // both stamps are GetTickCount64 on this VPS
+      g_lag_measured = true;
+      g_lag_active   = false;             // measure once per cycle
+   }
+}
+
+// Ring buffer: append one JSON event, dropping the oldest if at cap.
+void TelemetryEnqueue(string ev)
+{
+   int n = ArraySize(g_tel_q);
+   if(n >= TEL_QUEUE_CAP)
+   {
+      for(int i = 1; i < n; i++) g_tel_q[i - 1] = g_tel_q[i];
+      g_tel_q[n - 1] = ev;
+   }
+   else
+   {
+      ArrayResize(g_tel_q, n + 1);
+      g_tel_q[n] = ev;
+   }
+}
+
+// Build a heartbeat event JSON (common envelope + free-form payload).
+string BuildHeartbeatJson(string role, string broker, long login, string symbol,
+                          long ticks, double spread_pts)
+{
+   string s = "{";
+   s += "\"deployment_id\":\"" + JsonEsc(InpDeploymentId) + "\",";
+   s += "\"ea_version\":\""     + EA_VERSION + "\",";
+   s += "\"role\":\""           + JsonEsc(role) + "\",";
+   s += "\"broker\":\""         + JsonEsc(broker) + "\",";
+   s += "\"symbol\":\""         + JsonEsc(symbol) + "\",";
+   s += "\"login\":"            + IntegerToString(login) + ",";
+   s += "\"vps_host\":\""       + JsonEsc(InpVpsHost) + "\",";
+   s += "\"vps_port\":"         + IntegerToString(InpVpsPort) + ",";
+   s += "\"event_type\":\"heartbeat\",";
+   s += "\"payload\":{\"ticks\":" + IntegerToString(ticks) +
+        ",\"spread_pts\":" + JDbl(spread_pts) + "}";
+   s += "}";
+   return s;
+}
+
+// Build the cycle event JSON from the captured g_cyc state.
+// V4.3 is single-leg: every hedge_* field is emitted as JSON null, hedge_opened
+// is false, and final_state is always "SINGLE_LEG". exit_reason is sent verbatim
+// (V4.3's own reason string — NOT mapped to V4.4b's enum).
+string BuildCycleJson()
+{
+   string uid = StringFormat("%s-%I64d", InpDeploymentId, g_cyc.t_signal);
+   long sig2fill = g_cyc.t_leg1_fill - g_cyc.t_signal;
+   long dur      = g_cyc.t_close - g_cyc.t_signal;
+   bool is_win   = (g_cyc.net_pts > 0.0);
+
+   string p = "{";
+   p += "\"cycle_uid\":\""      + JsonEsc(uid) + "\",";
+   p += "\"direction\":\""      + JsonEsc(g_cyc.direction) + "\",";
+   p += "\"t_signal\":"         + IntegerToString(g_cyc.t_signal) + ",";
+   p += "\"t_leg1_fill\":"      + IntegerToString(g_cyc.t_leg1_fill) + ",";
+   p += "\"t_hedge_fill\":null,";
+   p += "\"t_close\":"          + IntegerToString(g_cyc.t_close) + ",";
+   p += "\"opened_at\":\""      + JsonEsc(g_cyc.opened_at_iso) + "\",";
+   p += "\"cycle_duration_ms\":"+ IntegerToString(dur) + ",";
+   p += "\"ab_lag_ms\":"        + (g_lag_measured ? IntegerToString(g_lag_ms) : "null") + ",";
+   p += "\"signal_to_fill_ms\":"+ IntegerToString(sig2fill) + ",";
+   p += "\"a_delta_pts\":"      + JDbl(g_cyc.a_delta_pts) + ",";
+   p += "\"a_brokers_agreed\":" + IntegerToString(g_cyc.a_brokers_agreed) + ",";
+   p += "\"a_price_at_signal\":"+ JDbl(g_cyc.a_price_at_signal) + ",";
+   p += "\"b_price_at_signal\":"+ JDbl(g_cyc.b_price_at_signal) + ",";
+   p += "\"b_spread_pts_at_signal\":" + JDbl(g_cyc.b_spread_pts_at_signal) + ",";
+   p += "\"hedge_opened\":false,";
+   p += "\"hedge_trigger_pts_used\":null,";
+   p += "\"leg1_ticket\":"      + IntegerToString((long)g_cyc.leg1_ticket) + ",";
+   p += "\"leg1_expected_price\":" + JDbl(g_cyc.leg1_expected_price) + ",";
+   p += "\"leg1_actual_price\":"   + JDbl(g_cyc.leg1_actual_price) + ",";
+   p += "\"leg1_slippage_pts\":"   + JDbl(g_cyc.leg1_slippage_pts) + ",";
+   p += "\"hedge_ticket\":null,";
+   p += "\"hedge_expected_price\":null,";
+   p += "\"hedge_actual_price\":null,";
+   p += "\"hedge_slippage_pts\":null,";
+   p += "\"locked_profit_pts\":null,";
+   p += "\"exit_reason\":\""     + JsonEsc(g_cyc.exit_reason) + "\",";
+   p += "\"final_state\":\""     + JsonEsc(g_cyc.final_state) + "\",";
+   p += "\"gross_pts\":"         + JDbl(g_cyc.gross_pts) + ",";
+   p += "\"net_pts\":"           + JDbl(g_cyc.net_pts) + ",";
+   p += "\"net_money\":"         + JDbl(g_cyc.net_money) + ",";
+   p += "\"is_win\":"            + (is_win ? "true" : "false") + ",";
+   p += "\"session\":\""         + JsonEsc(g_cyc.session) + "\",";
+   p += "\"b_atr_m1_pts\":"      + JDbl(g_cyc.b_atr_m1_pts);
+   p += "}";
+
+   string ev = "{";
+   ev += "\"deployment_id\":\"" + JsonEsc(InpDeploymentId) + "\",";
+   ev += "\"ea_version\":\""     + EA_VERSION + "\",";
+   ev += "\"role\":\"B\",";
+   ev += "\"broker\":\""         + JsonEsc(AccountInfoString(ACCOUNT_COMPANY)) + "\",";
+   ev += "\"symbol\":\""         + JsonEsc(_Symbol) + "\",";
+   ev += "\"event_type\":\"cycle\",";
+   ev += "\"payload\":"          + p;
+   ev += "}";
+   return ev;
+}
+
+// Called at every cycle-end site. Fills the outcome fields, builds the cycle
+// event and enqueues it (no HTTP here — flush happens in OnTimer).
+// net_pts must be the SAME value the EA logs for this cycle (passed by the
+// call site), so telemetry never diverges from the EA's own accounting.
+void FinalizeCycleTelemetry(string exit_reason, string final_state, double net_pts)
+{
+   if(!g_cyc.active) return;              // no live cycle / already finalized
+   g_cyc.active = false;
+
+   g_cyc.t_close     = NowMs();
+   if(StringLen(exit_reason) > 0) g_cyc.exit_reason = exit_reason;
+   g_cyc.final_state = final_state;       // always "SINGLE_LEG" for V4.3
+   g_cyc.net_pts     = net_pts;
+   g_cyc.gross_pts   = net_pts;           // gross not separately measured (see report)
+   g_cyc.net_money   = PositionNetMoney(g_cyc.leg1_ticket);
+
+   g_lag_active = false;                  // stop measuring for this cycle
+
+   if(!InpTelemetryEnabled) return;
+   string js = BuildCycleJson();
+   TelemetryEnqueue(js);
+   Print("[TEL] cycle enqueued: " + js);
+}
+
+// Enqueue B's own heartbeat + (relayed) A1's heartbeat. B only.
+void TelemetryEnqueueHeartbeats()
+{
+   if(!InpTelemetryEnabled) return;
+
+   // B's own heartbeat
+   double b_bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double b_ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double b_spread = (b_ask - b_bid) / _Point;
+   TelemetryEnqueue(BuildHeartbeatJson("B",
+                    AccountInfoString(ACCOUNT_COMPANY),
+                    AccountInfoInteger(ACCOUNT_LOGIN),
+                    _Symbol, g_count, b_spread));
+
+   // A1's heartbeat, relayed from its file (A never sends HTTP itself).
+   double a_bid, a_ask, a_spread; string a_broker, a_symbol; long a_login, a_tick, a_msc;
+   if(ReadHeartbeatFromFile(HB_FILE_A1, a_msc, a_bid, a_ask, a_spread,
+                            a_broker, a_login, a_symbol, a_tick))
+   {
+      g_a1_msc = a_msc; g_a1_bid = a_bid; g_a1_ask = a_ask; g_a1_ok = true;
+      g_a1_spread = a_spread; g_a1_broker = a_broker; g_a1_login = a_login;
+      g_a1_symbol = a_symbol; g_a1_tick = a_tick;
+
+      long age = NowMs() - a_msc;
+      // Only relay while fresh enough; skip old-format files with no identity.
+      if(age >= 0 && age <= A_STALE_RELAY_MS && StringLen(a_symbol) > 0)
+      {
+         TelemetryEnqueue(BuildHeartbeatJson("A1", a_broker, a_login,
+                          a_symbol, a_tick, a_spread));
+      }
+   }
+}
+
+// Flush the queue over HTTP. ONLY called from OnTimer. Batched, idempotent
+// (cycle_uid dedups), retries on failure by leaving events in the queue.
+void TelemetryFlush()
+{
+   if(!InpTelemetryEnabled)  return;
+   if(g_is_watcher)          return;   // A never sends HTTP
+   if(g_b_pos_open)          return;   // never stall mid-position (V4.4b: g_cycle_state != CYCLE_IDLE)
+   int n = ArraySize(g_tel_q);
+   if(n == 0)                return;
+
+   int batch = (n < TEL_BATCH_MAX) ? n : TEL_BATCH_MAX;
+   string body = "{\"events\":[";
+   for(int i = 0; i < batch; i++)
+   {
+      if(i > 0) body += ",";
+      body += g_tel_q[i];
+   }
+   body += "]}";
+
+   string headers = "Content-Type: application/json\r\n"
+                    "Authorization: Bearer " + InpIngestKey + "\r\n";
+   uchar data[];
+   int dl = StringToCharArray(body, data, 0, -1, CP_UTF8) - 1;
+   if(dl < 0) dl = 0;
+   ArrayResize(data, dl);
+   uchar  result[];
+   string result_headers;
+   ResetLastError();
+   int res = WebRequest("POST", InpTelemetryUrl, headers, 1500, data, result, result_headers);
+
+   if(res == 200)
+   {
+      int rem = n - batch;                       // drop the sent prefix
+      for(int i = 0; i < rem; i++) g_tel_q[i] = g_tel_q[i + batch];
+      ArrayResize(g_tel_q, rem);
+   }
+   else if(res == -1)
+   {
+      int err = GetLastError();
+      if(err == 4014)
+         Print("[TEL] WebRequest not allowed. Add " + InpTelemetryUrl +
+               " in Tools>Options>Expert Advisors (terminal B only).");
+      else
+         PrintFormat("[TEL] WebRequest failed err=%d — keeping %d events for retry", err, n);
+   }
+   else
+   {
+      PrintFormat("[TEL] HTTP %d — keeping %d events for retry", res, n);
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -869,6 +1370,21 @@ int OnInit()
                      InpAdxPeriod, InpAdxThreshold, (int)InpFilterTF);
    }
 
+   // Telemetry setup (B executor only) — ATR handle for b_atr_m1_pts + state.
+   if(!g_is_watcher)
+   {
+      ResetCycleTelemetry();
+      ArrayResize(g_tel_q, 0);
+      g_tel_last_hb_ms    = 0;
+      g_tel_last_flush_ms = NowMs();
+      g_atr_handle = iATR(_Symbol, PERIOD_M1, 14);
+      if(g_atr_handle == INVALID_HANDLE)
+         PrintFormat("[B] WARNING: ATR handle failed err=%d — b_atr_m1_pts will be 0", GetLastError());
+      if(InpTelemetryEnabled)
+         PrintFormat("[B] Telemetry ON  deployment=%s  url=%s  (WebRequest allowlist required)",
+                     InpDeploymentId, InpTelemetryUrl);
+   }
+
    PrintFormat("AURUM_LatencyArb_V4.3 [%s] started. broker=%s symbol=%s -> %s%s  hb_file=%s",
                g_tag, broker, sym,
                (InpUseCommonDir?"[Common]\\Files\\":"\\Files\\"), g_filename,
@@ -905,6 +1421,7 @@ void OnTick()
       // B — read 3 heartbeats, consensus check, monitor open position
       ExecutorConsensusCheck();
       MonitorPosition();
+      UpdateLagMeasurement();   // observability only — NO WebRequest on this path
    }
 
    if(!new_tick || g_fh == INVALID_HANDLE) return;
@@ -953,6 +1470,23 @@ void OnTick()
 void OnTimer()
 {
    if(g_fh != INVALID_HANDLE) FileFlush(g_fh);
+
+   // ---- Telemetry (B executor only) — the ONLY place WebRequest runs ----
+   if(!g_is_watcher && InpTelemetryEnabled)
+   {
+      long tnow = NowMs();
+      if(g_tel_last_hb_ms == 0 || (tnow - g_tel_last_hb_ms) >= (long)InpHeartbeatSec * 1000)
+      {
+         TelemetryEnqueueHeartbeats();
+         g_tel_last_hb_ms = tnow;
+      }
+      if((tnow - g_tel_last_flush_ms) >= (long)InpTelemetryFlushSec * 1000)
+      {
+         TelemetryFlush();   // internally no-ops unless flat (g_b_pos_open == false)
+         g_tel_last_flush_ms = tnow;
+      }
+   }
+
    if(!InpShowHeartbeat) return;
 
    double avg_gap_ms = 0.0, avg_spread_pts = 0.0;
@@ -989,9 +1523,10 @@ void OnTimer()
                         StringLen(g_b_last_close_reason)>0 ? g_b_last_close_reason : "(none)");
 
       long now = NowMs();
-      bool a1_act = g_a1_ok && (now - g_a1_msc) <= InpMaxHeartbeatAgeMs;
-      bool a2_act = g_a2_ok && (now - g_a2_msc) <= InpMaxHeartbeatAgeMs;
-      bool a3_act = g_a3_ok && (now - g_a3_msc) <= InpMaxHeartbeatAgeMs;
+      long age1 = now - g_a1_msc, age2 = now - g_a2_msc, age3 = now - g_a3_msc;
+      bool a1_act = g_a1_ok && age1 >= 0 && age1 <= InpMaxHeartbeatAgeMs;
+      bool a2_act = g_a2_ok && age2 >= 0 && age2 <= InpMaxHeartbeatAgeMs;
+      bool a3_act = g_a3_ok && age3 >= 0 && age3 <= InpMaxHeartbeatAgeMs;
       int active_count = (a1_act?1:0) + (a2_act?1:0) + (a3_act?1:0);
 
       string a1_status = a1_act
@@ -1076,6 +1611,11 @@ void OnDeinit(const int reason)
       IndicatorRelease(g_adx_handle);
       g_adx_handle = INVALID_HANDLE;
    }
+   if(g_atr_handle != INVALID_HANDLE)
+   {
+      IndicatorRelease(g_atr_handle);
+      g_atr_handle = INVALID_HANDLE;
+   }
    if(g_fh != INVALID_HANDLE)
    {
       FileFlush(g_fh); FileClose(g_fh);
@@ -1100,4 +1640,30 @@ void OnDeinit(const int reason)
    }
    TG_Shutdown("V4.3", g_tag, summary);
 }
+//+------------------------------------------------------------------+
+//|                        DASHBOARD SETUP                            |
+//|                                                                  |
+//|  Telemetry (dashboard) transport — terminal B ONLY:              |
+//|                                                                  |
+//|  1. On terminal B, open:                                         |
+//|        Tools -> Options -> Expert Advisors                       |
+//|     Tick "Allow WebRequest for listed URL" and ADD:             |
+//|        https://aurum-trading-dashboard.vercel.app               |
+//|     (A watchers never call WebRequest — do NOT add it there.)    |
+//|                                                                  |
+//|  2. Set the SAME InpDeploymentId on A and B (default v43-01).    |
+//|                                                                  |
+//|  3. Only terminal B posts to the dashboard. It sends:            |
+//|       - heartbeat every InpHeartbeatSec: one for B (role "B")    |
+//|         and one relayed for A (role "A1", read from A's HB file).|
+//|       - one cycle event when each single-leg trade closes.       |
+//|                                                                  |
+//|  V4.3 is single-leg only: every hedge_* field in the cycle       |
+//|  payload is null, hedge_opened is false, and final_state is      |
+//|  always "SINGLE_LEG". exit_reason carries V4.3's own reason      |
+//|  string (TIMEOUT / SL_HIT / TP_HIT / ...), not V4.4b's enum.     |
+//|                                                                  |
+//|  WebRequest is called ONLY from OnTimer -> TelemetryFlush and    |
+//|  ONLY while flat (g_b_pos_open == false). OnTick never touches   |
+//|  the network (telemetry side) — it only enqueues.               |
 //+------------------------------------------------------------------+
