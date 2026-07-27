@@ -35,9 +35,24 @@
 //|    - Optional Volume filter                                      |
 //|                                                                  |
 //|  Uses [Common]\Files\ — all 4 MT5 terminals must run on same VPS |
+//|                                                                  |
+//|  Changelog:                                                      |
+//|    1.33 - Position-id tracking rebuild:                          |
+//|           * resolve the POSITION id from the deal (DEAL_POSITION |
+//|             _ID) instead of trusting trade.ResultOrder(), which  |
+//|             diverges on some hedging brokers (e.g. Vantage) and  |
+//|             left positions un-selectable, un-SL'd and orphaned.  |
+//|           * SL is now mandatory: retry, then close the position  |
+//|             rather than ever run it unprotected.                 |
+//|           * single-slot B state replaced by a configurable slot  |
+//|             array (InpMaxConcurrent, 1-3 concurrent positions),  |
+//|             each slot timing out and telemetering independently. |
+//|           * orphan sweeper closes any magic position no slot is  |
+//|             tracking (OnTimer, B only).                          |
+//|           * optional UTC session-window filter (TimeGMT).        |
 //+------------------------------------------------------------------+
 #property copyright "AURUM TECH"
-#property version   "1.31"
+#property version   "1.33"
 #property strict
 #property description "Latency arb V4.3 - Multi-broker A consensus (Tickmill+Pepperstone+IC Markets → GOC)"
 #property description "Requires MT5 in HEDGING mode for B. All 4 terminals on same VPS (LD4)."
@@ -168,17 +183,21 @@ input ENUM_ROLE      InpRole              = ROLE_A1_WATCHER;
 input group "=== Trade ==="
 input double         InpLots              = 0.01;
 input bool           InpReverseSignal     = false;   // Reverse: BUY signal opens SELL, and vice versa
+input int            InpMaxConcurrent     = 1;       // Max positions open at once (1-3). Tested: 2 gives no gain over 1.
 
 input group "=== Consensus (B executor) ==="
-input double         InpConsensusThreshold = 45.0;   // Min |delta| per broker to count (lower than V4.2 — offset by 3-broker confirmation)
-input int            InpRequireConsensus  = 3;       // How many of 3 must agree (2 = 2/3 loose, 3 = strict all)
+input double         InpConsensusThreshold = 80.0;   // Min |delta| per broker to count (measured optimum; survives up to ~30 pts slippage)
+input int            InpRequireConsensus  = 1;       // How many of 3 must agree (2 = 2/3 loose, 3 = strict all)
 input double         InpMaxAgreeSpread    = 150.0;   // Max spread between 3 deltas (glitch detection)
 input int            InpMaxHeartbeatAgeMs = 500;     // Max age of A heartbeat before treating as stale
 input int            InpCooldownMs        = 3000;    // Between consecutive signals
 input ENUM_TRADE_DIR InpDirection         = DIR_BOTH;
+input bool           InpUseSessionFilter  = false;   // Restrict trading to a UTC time window
+input int            InpSessionStartUTC   = 12;      // Inclusive hour, server-independent (uses TimeGMT)
+input int            InpSessionEndUTC     = 21;      // Exclusive hour
 
 input group "=== Signal Quality Filters (B side) ==="
-input bool           InpUseAdxFilter      = true;     // Enable ADX trend strength filter (uses B's chart)
+input bool           InpUseAdxFilter      = false;    // Enable ADX trend strength filter (uses B's chart)
 input ENUM_TIMEFRAMES InpFilterTF         = PERIOD_M1;
 input int            InpAdxPeriod         = 14;
 input double         InpAdxThreshold      = 25.0;
@@ -187,10 +206,10 @@ input int            InpVolumeLookback    = 20;
 input double         InpVolumeMultiplier  = 1.5;
 
 input group "=== SL / TP Bracket (B — autonomous) ==="
-input double         InpTpPts             = 20.0;    // Take profit target (net pts, armed after breakeven)
-input double         InpSlPts             = 60.0;    // Stop loss cap (net pts) - must be > spread
-input double         InpMaxSpreadPts      = 55.0;    // Skip signal if current spread > this (spike guard)
-input int            InpMaxHoldMs         = 5000;    // Timeout backstop (ms)
+input double         InpTpPts             = 100.0;   // Take profit target (net pts, armed after breakeven; measured convergence 93-113 pts)
+input double         InpSlPts             = 100.0;   // Stop loss cap (net pts) - must be > spread (symmetric with TP)
+input double         InpMaxSpreadPts      = 25.0;    // Skip signal if current spread > this (executor spread is ~13 pts)
+input int            InpMaxHoldMs         = 10000;   // Timeout backstop (ms)
 input int            InpExecCooldownMs    = 500;
 
 input group "=== Tick Logger ==="
@@ -215,6 +234,7 @@ input int    InpLagTimeoutMs      = 3000;
 
 //=================== CONSTANTS =====================================
 #define MAGIC              20260730
+#define MAX_SLOTS          3
 #define EA_VERSION         "4.3"
 #define TEL_QUEUE_CAP      200
 #define TEL_BATCH_MAX      20
@@ -277,18 +297,15 @@ long     g_skip_adx        = 0;   // ADX filter blocked
 long     g_skip_vol        = 0;   // volume filter blocked
 long     g_skip_spread     = 0;   // B spread too wide
 long     g_skip_cooldown   = 0;   // still in cooldown
+long     g_skip_session    = 0;   // outside the UTC session window (filter on)
 
-// B — position tracking
-bool     g_b_pos_open        = false;
-string   g_b_pos_action      = "";
-ulong    g_b_pos_ticket      = 0;
-double   g_b_pos_entry_price = 0.0;
-double   g_b_pos_sl_price    = 0.0;
-double   g_b_pos_tp_price    = 0.0;
-bool     g_b_pos_tp_armed    = false;
-long     g_b_pos_open_msc    = 0;
+// B — position tracking.
+// The old single-slot scalars (g_b_pos_*) are replaced by g_slots[] (defined
+// just after the CycleTelemetry struct, since each slot embeds a cycle record).
 string   g_b_last_close_reason = "";
-double   g_b_pos_entry_delta = 0.0;  // consensus delta at entry (median)
+int      g_max_concurrent      = 1;   // clamped InpMaxConcurrent (set in OnInit)
+long     g_magic               = 0;   // value passed to SetExpertMagicNumber (OnInit)
+int      g_orphans_closed      = 0;   // running count of orphan positions swept
 
 // ADX + volume handles/state (B only)
 double   g_b_last_adx        = 0.0;
@@ -356,32 +373,81 @@ struct CycleTelemetry
    double net_pts;
    double net_money;
 };
-CycleTelemetry g_cyc;
-
-void ResetCycleTelemetry()
+void ResetCycleTelemetry(CycleTelemetry &c)
 {
-   g_cyc.active                 = false;
-   g_cyc.t_signal               = 0;
-   g_cyc.direction              = "";
-   g_cyc.a_delta_pts            = 0.0;
-   g_cyc.a_brokers_agreed       = 0;
-   g_cyc.a_price_at_signal      = 0.0;
-   g_cyc.b_price_at_signal      = 0.0;
-   g_cyc.b_spread_pts_at_signal = 0.0;
-   g_cyc.opened_at_iso          = "";
-   g_cyc.session                = "";
-   g_cyc.b_atr_m1_pts           = 0.0;
-   g_cyc.t_leg1_fill            = 0;
-   g_cyc.leg1_ticket            = 0;
-   g_cyc.leg1_expected_price    = 0.0;
-   g_cyc.leg1_actual_price      = 0.0;
-   g_cyc.leg1_slippage_pts      = 0.0;
-   g_cyc.t_close                = 0;
-   g_cyc.exit_reason            = "";
-   g_cyc.final_state            = "";
-   g_cyc.gross_pts              = 0.0;
-   g_cyc.net_pts                = 0.0;
-   g_cyc.net_money              = 0.0;
+   c.active                 = false;
+   c.t_signal               = 0;
+   c.direction              = "";
+   c.a_delta_pts            = 0.0;
+   c.a_brokers_agreed       = 0;
+   c.a_price_at_signal      = 0.0;
+   c.b_price_at_signal      = 0.0;
+   c.b_spread_pts_at_signal = 0.0;
+   c.opened_at_iso          = "";
+   c.session                = "";
+   c.b_atr_m1_pts           = 0.0;
+   c.t_leg1_fill            = 0;
+   c.leg1_ticket            = 0;
+   c.leg1_expected_price    = 0.0;
+   c.leg1_actual_price      = 0.0;
+   c.leg1_slippage_pts      = 0.0;
+   c.t_close                = 0;
+   c.exit_reason            = "";
+   c.final_state            = "";
+   c.gross_pts              = 0.0;
+   c.net_pts                = 0.0;
+   c.net_money              = 0.0;
+}
+
+//=================== B POSITION SLOTS ==============================
+// One slot per concurrent B position (1..MAX_SLOTS, configured by
+// InpMaxConcurrent). Each slot owns its own cycle-telemetry record so two
+// open positions can never overwrite each other's t_signal / slippage etc.
+struct PosSlot
+{
+   bool           active;
+   ulong          ticket;
+   string         action;       // ACTION_BUY / ACTION_SELL
+   double         entry_price;
+   double         sl_price;
+   double         tp_price;
+   bool           tp_armed;
+   long           open_msc;
+   CycleTelemetry cyc;          // per-slot telemetry record
+};
+PosSlot g_slots[MAX_SLOTS];
+
+int ActiveSlots()
+{
+   int n = 0;
+   for(int i = 0; i < MAX_SLOTS; i++) if(g_slots[i].active) n++;
+   return n;
+}
+
+int FreeSlotIndex()
+{
+   for(int i = 0; i < MAX_SLOTS; i++) if(!g_slots[i].active) return i;
+   return -1;
+}
+
+int SlotByTicket(ulong t)
+{
+   for(int i = 0; i < MAX_SLOTS; i++)
+      if(g_slots[i].active && g_slots[i].ticket == t) return i;
+   return -1;
+}
+
+void ClearSlot(int i)
+{
+   g_slots[i].active      = false;
+   g_slots[i].ticket      = 0;
+   g_slots[i].action      = "";
+   g_slots[i].entry_price = 0.0;
+   g_slots[i].sl_price    = 0.0;
+   g_slots[i].tp_price    = 0.0;
+   g_slots[i].tp_armed    = false;
+   g_slots[i].open_msc    = 0;
+   ResetCycleTelemetry(g_slots[i].cyc);
 }
 
 //+------------------------------------------------------------------+
@@ -426,6 +492,21 @@ string SessionFromGmt()
    if(h >= 12 && h < 16) return "LONDON_NY_OVERLAP";
    if(h >= 16 && h < 21) return "NY";
    return "ASIA";  // 21-24
+}
+
+// UTC session-window gate (B). Uses TimeGMT() so the window is broker-server
+// independent — the A/B pair may run on brokers with different server times.
+// Handles a window that wraps past midnight (start > end, e.g. 21..6).
+bool InSessionWindow()
+{
+   if(!InpUseSessionFilter) return true;
+   MqlDateTime d; TimeToStruct(TimeGMT(), d);
+   int h = d.hour;
+   int s = InpSessionStartUTC;
+   int e = InpSessionEndUTC;
+   if(s == e) return true;               // degenerate window → treat as always-on
+   if(s < e)  return (h >= s && h < e);  // normal window
+   return (h >= s || h < e);             // wraps past midnight
 }
 
 // B's ATR(M1,14) in points. 0.0 if handle/data not ready.
@@ -558,10 +639,45 @@ bool ReadHeartbeatFromFile(string fname, long &out_msc, double &out_bid, double 
 }
 
 //+------------------------------------------------------------------+
+//| B: close any position with our magic that no slot is tracking.    |
+//| Reachable only from OnTimer (routine sweep, B only) and from the  |
+//| OpenPosition critical-failure branch (immediate cleanup of a      |
+//| just-opened position we could not select/register).              |
+//+------------------------------------------------------------------+
+int CloseOrphans()
+{
+   int closed = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong pos = PositionGetTicket(i);
+      if(pos == 0) continue;
+      if(!PositionSelectByTicket(pos)) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != g_magic) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(SlotByTicket(pos) >= 0) continue;                 // legitimately held
+      if(trade.PositionClose(pos))
+      {
+         closed++;
+         PrintFormat("[B] ORPHAN CLOSED ticket=%I64u — no slot was tracking it", pos);
+      }
+   }
+   g_orphans_closed += closed;
+   return closed;
+}
+
+//+------------------------------------------------------------------+
 //| B: open + close position                                          |
 //+------------------------------------------------------------------+
 void OpenPosition(string action, double lots)
 {
+   int slot = FreeSlotIndex();
+   if(slot < 0)
+   {
+      PrintFormat("[B] %s SKIPPED — no free slot (%d/%d active)",
+                  action, ActiveSlots(), g_max_concurrent);
+      return;
+   }
+
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double point = _Point;
@@ -605,7 +721,33 @@ void OpenPosition(string action, double lots)
       return;
    }
 
-   ulong ticket = trade.ResultOrder();
+   // --- Resolve the REAL position id from the deal. trade.ResultOrder() is the
+   //     ORDER ticket; on some hedging brokers (e.g. Vantage) the position id
+   //     differs, and PositionSelectByTicket / PositionModify then fail — which
+   //     is how naked, orphaned positions happened. DEAL_POSITION_ID is the
+   //     authoritative position id; fall back to the order only where they
+   //     coincide. Then verify we can actually select it before continuing. ---
+   ulong ticket = 0;
+   ulong deal   = trade.ResultDeal();
+   if(deal > 0 && HistoryDealSelect(deal))
+      ticket = (ulong)HistoryDealGetInteger(deal, DEAL_POSITION_ID);
+   if(ticket == 0)
+      ticket = trade.ResultOrder();          // brokers where they coincide
+
+   bool selectable = false;
+   for(int attempt = 0; attempt < 5; attempt++)
+   {
+      if(PositionSelectByTicket(ticket)) { selectable = true; break; }
+      Sleep(20);
+   }
+   if(!selectable)
+   {
+      PrintFormat("[B] CRITICAL: cannot select position after open. deal=%I64u order=%I64u resolved=%I64u",
+                  deal, trade.ResultOrder(), ticket);
+      CloseOrphans();                        // sweep the position we could not register
+      return;
+   }
+
    double actual_entry = trade.ResultPrice();  // ← ACTUAL fill price
    if(actual_entry <= 0)
    {
@@ -621,190 +763,192 @@ void OpenPosition(string action, double lots)
    else
       sl_price = NormalizeDouble(actual_entry + InpSlPts * point, digits);
 
-   // Modify position to add SL only (TP deferred)
-   if(!trade.PositionModify(ticket, sl_price, 0))
+   // --- SL is MANDATORY. Retry a few times, then close the position rather than
+   //     ever run it unprotected. No code path may register a slot without SL. ---
+   bool sl_set = false;
+   for(int attempt = 0; attempt < 3; attempt++)
    {
-      PrintFormat("[B] Failed to set SL on ticket %I64u: %d (%s)",
-                  ticket, trade.ResultRetcode(), trade.ResultRetcodeDescription());
-      // continue anyway — position is open with no SL yet, timeout will backstop
+      if(trade.PositionModify(ticket, sl_price, 0)) { sl_set = true; break; }
+      PrintFormat("[B] SL attempt %d failed on %I64u: %d (%s)",
+                  attempt + 1, ticket, trade.ResultRetcode(), trade.ResultRetcodeDescription());
+      Sleep(30);
+   }
+   if(!sl_set)
+   {
+      PrintFormat("[B] ABORT: no SL could be attached to %I64u — closing immediately", ticket);
+      trade.PositionClose(ticket);
+      return;                                 // never register an unprotected position
    }
 
    long now = NowMs();
 
-   g_b_pos_open        = true;
-   g_b_pos_action      = action;
-   g_b_pos_ticket      = ticket;
-   g_b_pos_entry_price = actual_entry;
-   g_b_pos_sl_price    = sl_price;
-   g_b_pos_tp_price    = 0.0;
-   g_b_pos_tp_armed    = false;
-   g_b_pos_open_msc    = now;
+   g_slots[slot].active      = true;
+   g_slots[slot].action      = action;
+   g_slots[slot].ticket      = ticket;
+   g_slots[slot].entry_price = actual_entry;
+   g_slots[slot].sl_price    = sl_price;
+   g_slots[slot].tp_price    = 0.0;
+   g_slots[slot].tp_armed    = false;
+   g_slots[slot].open_msc    = now;
    g_b_last_exec_msc   = now;
    g_b_exec_count++;
 
    // --- Telemetry: leg1 fill (signed slippage = disadvantage direction) ---
-   g_cyc.t_leg1_fill         = now;
-   g_cyc.leg1_ticket         = ticket;
-   g_cyc.leg1_expected_price = expected_price;
-   g_cyc.leg1_actual_price   = actual_entry;
-   g_cyc.leg1_slippage_pts   = (action == ACTION_BUY)
+   //     Written into THIS slot's cycle record (staged at signal time).
+   g_slots[slot].cyc.t_leg1_fill         = now;
+   g_slots[slot].cyc.leg1_ticket         = ticket;
+   g_slots[slot].cyc.leg1_expected_price = expected_price;
+   g_slots[slot].cyc.leg1_actual_price   = actual_entry;
+   g_slots[slot].cyc.leg1_slippage_pts   = (action == ACTION_BUY)
                                ? (actual_entry - expected_price) / point   // paid more = worse
                                : (expected_price - actual_entry) / point;  // sold lower = worse
-   g_cyc.active = true;   // real trade opened → this cycle will emit telemetry
+   g_slots[slot].cyc.active = true;   // real trade opened → this cycle will emit telemetry
 
    // Open the ab_lag measurement window (timeout measured from t_signal).
+   // ab_lag remains a single global best-effort measurement — exact at
+   // InpMaxConcurrent=1; with >1 concurrent it tracks the most recent open.
    g_lag_active   = true;
    g_lag_measured = false;
    g_lag_ms       = 0;
-   g_lag_start_ms = g_cyc.t_signal;
+   g_lag_start_ms = g_slots[slot].cyc.t_signal;
 
-   PrintFormat("[B] OPEN %s ticket=%I64u lots=%.2f entry=%.*f SL=%.*f  (TP deferred until breakeven)",
-               action, ticket, lots, digits, actual_entry, digits, sl_price);
+   PrintFormat("[B] OPEN[%d] %s ticket=%I64u lots=%.2f entry=%.*f SL=%.*f  (TP deferred until breakeven)",
+               slot, action, ticket, lots, digits, actual_entry, digits, sl_price);
    TG_OrderOpen(action, AccountInfoString(ACCOUNT_COMPANY), _Symbol,
                 lots, actual_entry, digits, ticket);
 }
 
-double CurrentPnLPts()
+double CurrentPnLPts(int slot)
 {
-   if(!g_b_pos_open) return 0.0;
+   if(!g_slots[slot].active) return 0.0;
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   if(g_b_pos_action == ACTION_BUY)
-      return (bid - g_b_pos_entry_price) / _Point;
-   return (g_b_pos_entry_price - ask) / _Point;
+   if(g_slots[slot].action == ACTION_BUY)
+      return (bid - g_slots[slot].entry_price) / _Point;
+   return (g_slots[slot].entry_price - ask) / _Point;
 }
 
-void ClosePosition(string reason)
+void ClosePosition(int slot, string reason)
 {
-   if(!g_b_pos_open) return;
-   double pnl_pts = CurrentPnLPts();
-   long duration = NowMs() - g_b_pos_open_msc;
-   ulong ticket = g_b_pos_ticket;
-   string action = g_b_pos_action;
+   if(!g_slots[slot].active) return;
+   double pnl_pts = CurrentPnLPts(slot);
+   long duration = NowMs() - g_slots[slot].open_msc;
+   ulong ticket = g_slots[slot].ticket;
+   string action = g_slots[slot].action;
 
    if(trade.PositionClose(ticket))
    {
-      g_b_pos_open        = false;
-      g_b_pos_action      = "";
-      g_b_pos_ticket      = 0;
-      g_b_pos_entry_price = 0.0;
-      g_b_pos_sl_price    = 0.0;
-      g_b_pos_tp_price    = 0.0;
-      g_b_pos_tp_armed    = false;
-      g_b_pos_open_msc    = 0;
       g_b_close_count++;
       g_b_last_close_reason = reason;
-      PrintFormat("[B] CLOSE %s reason=%s pnl=%.1f pts duration=%I64d ms ticket=%I64u",
-                  action, reason, pnl_pts, duration, ticket);
+      PrintFormat("[B] CLOSE[%d] %s reason=%s pnl=%.1f pts duration=%I64d ms ticket=%I64u",
+                  slot, action, reason, pnl_pts, duration, ticket);
       TG_OrderClose(action, reason, pnl_pts, duration, ticket);
       // --- Telemetry: EA-initiated close (V4.3 only ever calls this for TIMEOUT).
       //     net_pts is the SAME value the EA logs above, so telemetry cannot diverge.
-      FinalizeCycleTelemetry(reason, "SINGLE_LEG", pnl_pts);
+      //     Finalize reads this slot's cycle record, so it must run before ClearSlot.
+      FinalizeCycleTelemetry(slot, reason, "SINGLE_LEG", pnl_pts);
+      ClearSlot(slot);
    }
    else
    {
-      PrintFormat("[B] CLOSE failed reason=%s ticket=%I64u err=%d (%s)",
-                  reason, ticket, trade.ResultRetcode(), trade.ResultRetcodeDescription());
+      PrintFormat("[B] CLOSE[%d] failed reason=%s ticket=%I64u err=%d (%s)",
+                  slot, reason, ticket, trade.ResultRetcode(), trade.ResultRetcodeDescription());
    }
 }
 
 //+------------------------------------------------------------------+
-//| B: monitor position — detect broker-side SL/TP close + timeout   |
+//| B: monitor positions — detect broker-side SL/TP close + timeout   |
+//| Each active slot is handled independently (own open_msc timeout). |
 //+------------------------------------------------------------------+
 void MonitorPosition()
 {
-   if(!g_b_pos_open) return;
-
-   // Check if position still exists (broker may have closed via SL/TP)
-   if(!PositionSelectByTicket(g_b_pos_ticket))
+   for(int i = 0; i < MAX_SLOTS; i++)
    {
-      // Position closed by broker — determine reason from history
-      string reason = "BROKER_CLOSE";
-      double pnl_pts_est = 0.0;
-      long duration = NowMs() - g_b_pos_open_msc;
-      ulong closed_ticket = g_b_pos_ticket;
-      string closed_action = g_b_pos_action;
+      if(!g_slots[i].active) continue;
 
-      // Try to find the closing deal in history
-      if(HistorySelectByPosition(g_b_pos_ticket))
+      // Check if position still exists (broker may have closed via SL/TP)
+      if(!PositionSelectByTicket(g_slots[i].ticket))
       {
-         int deals = HistoryDealsTotal();
-         for(int i = deals - 1; i >= 0; i--)
+         // Position closed by broker — determine reason from history
+         string reason = "BROKER_CLOSE";
+         double pnl_pts_est = 0.0;
+         long duration = NowMs() - g_slots[i].open_msc;
+         ulong closed_ticket = g_slots[i].ticket;
+         string closed_action = g_slots[i].action;
+
+         // Try to find the closing deal in history
+         if(HistorySelectByPosition(g_slots[i].ticket))
          {
-            ulong deal_ticket = HistoryDealGetTicket(i);
-            if(deal_ticket == 0) continue;
-            if(HistoryDealGetInteger(deal_ticket, DEAL_POSITION_ID) != (long)g_b_pos_ticket) continue;
-            ENUM_DEAL_ENTRY entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(deal_ticket, DEAL_ENTRY);
-            if(entry != DEAL_ENTRY_OUT) continue;
+            int deals = HistoryDealsTotal();
+            for(int d = deals - 1; d >= 0; d--)
+            {
+               ulong deal_ticket = HistoryDealGetTicket(d);
+               if(deal_ticket == 0) continue;
+               if(HistoryDealGetInteger(deal_ticket, DEAL_POSITION_ID) != (long)g_slots[i].ticket) continue;
+               ENUM_DEAL_ENTRY entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(deal_ticket, DEAL_ENTRY);
+               if(entry != DEAL_ENTRY_OUT) continue;
 
-            ENUM_DEAL_REASON deal_reason = (ENUM_DEAL_REASON)HistoryDealGetInteger(deal_ticket, DEAL_REASON);
-            if(deal_reason == DEAL_REASON_SL)       reason = "SL_HIT";
-            else if(deal_reason == DEAL_REASON_TP)  reason = "TP_HIT";
-            else if(deal_reason == DEAL_REASON_SO)  reason = "STOPOUT";
-            else if(deal_reason == DEAL_REASON_EXPERT) reason = "EA_CLOSE";
-            else reason = StringFormat("REASON_%d", (int)deal_reason);
+               ENUM_DEAL_REASON deal_reason = (ENUM_DEAL_REASON)HistoryDealGetInteger(deal_ticket, DEAL_REASON);
+               if(deal_reason == DEAL_REASON_SL)       reason = "SL_HIT";
+               else if(deal_reason == DEAL_REASON_TP)  reason = "TP_HIT";
+               else if(deal_reason == DEAL_REASON_SO)  reason = "STOPOUT";
+               else if(deal_reason == DEAL_REASON_EXPERT) reason = "EA_CLOSE";
+               else reason = StringFormat("REASON_%d", (int)deal_reason);
 
-            double exit_price = HistoryDealGetDouble(deal_ticket, DEAL_PRICE);
-            if(closed_action == ACTION_BUY)
-               pnl_pts_est = (exit_price - g_b_pos_entry_price) / _Point;
-            else
-               pnl_pts_est = (g_b_pos_entry_price - exit_price) / _Point;
-            break;
+               double exit_price = HistoryDealGetDouble(deal_ticket, DEAL_PRICE);
+               if(closed_action == ACTION_BUY)
+                  pnl_pts_est = (exit_price - g_slots[i].entry_price) / _Point;
+               else
+                  pnl_pts_est = (g_slots[i].entry_price - exit_price) / _Point;
+               break;
+            }
+         }
+
+         g_b_close_count++;
+         g_b_last_close_reason = reason;
+
+         PrintFormat("[B] BROKER CLOSED[%d] %s reason=%s pnl=%.1f pts duration=%I64d ms ticket=%I64u",
+                     i, closed_action, reason, pnl_pts_est, duration, closed_ticket);
+         TG_OrderClose(closed_action, reason, pnl_pts_est, duration, closed_ticket);
+         // --- Telemetry: broker closed the position (SL/TP hit, stopout, etc.).
+         //     Finalize reads this slot's cycle record, so it must run before ClearSlot.
+         FinalizeCycleTelemetry(i, reason, "SINGLE_LEG", pnl_pts_est);
+         ClearSlot(i);
+         continue;
+      }
+
+      // Position still open — check TP arming and timeout
+      double pnl_pts = CurrentPnLPts(i);
+
+      // Arm TP once past breakeven (pnl >= 0 means we've cleared spread cost)
+      if(!g_slots[i].tp_armed && pnl_pts >= 0)
+      {
+         double point = _Point;
+         int digits = _Digits;
+         double tp_price = 0.0;
+         if(g_slots[i].action == ACTION_BUY)
+            tp_price = NormalizeDouble(g_slots[i].entry_price + InpTpPts * point, digits);
+         else
+            tp_price = NormalizeDouble(g_slots[i].entry_price - InpTpPts * point, digits);
+
+         if(trade.PositionModify(g_slots[i].ticket, g_slots[i].sl_price, tp_price))
+         {
+            g_slots[i].tp_price = tp_price;
+            g_slots[i].tp_armed = true;
+            PrintFormat("[B] TP ARMED[%d] at %.*f (pnl was %.1f pts) — broker will close on hit",
+                        i, digits, tp_price, pnl_pts);
+         }
+         else
+         {
+            PrintFormat("[B] Failed to arm TP[%d]: %d (%s)",
+                        i, trade.ResultRetcode(), trade.ResultRetcodeDescription());
          }
       }
 
-      g_b_pos_open        = false;
-      g_b_pos_action      = "";
-      g_b_pos_ticket      = 0;
-      g_b_pos_entry_price = 0.0;
-      g_b_pos_sl_price    = 0.0;
-      g_b_pos_tp_price    = 0.0;
-      g_b_pos_tp_armed    = false;
-      g_b_pos_open_msc    = 0;
-      g_b_close_count++;
-      g_b_last_close_reason = reason;
-
-      PrintFormat("[B] BROKER CLOSED %s reason=%s pnl=%.1f pts duration=%I64d ms ticket=%I64u",
-                  closed_action, reason, pnl_pts_est, duration, closed_ticket);
-      TG_OrderClose(closed_action, reason, pnl_pts_est, duration, closed_ticket);
-      // --- Telemetry: broker closed the position (SL/TP hit, stopout, etc.).
-      //     exit_reason is the raw V4.3 reason (SL_HIT / TP_HIT / TIMEOUT-independent);
-      //     net_pts matches the pnl the EA logs above.
-      FinalizeCycleTelemetry(reason, "SINGLE_LEG", pnl_pts_est);
-      return;
+      long elapsed = NowMs() - g_slots[i].open_msc;
+      if(elapsed >= InpMaxHoldMs)
+         ClosePosition(i, "TIMEOUT");
    }
-
-   // Position still open — check TP arming and timeout
-   double pnl_pts = CurrentPnLPts();
-
-   // Arm TP once past breakeven (pnl >= 0 means we've cleared spread cost)
-   if(!g_b_pos_tp_armed && pnl_pts >= 0)
-   {
-      double point = _Point;
-      int digits = _Digits;
-      double tp_price = 0.0;
-      if(g_b_pos_action == ACTION_BUY)
-         tp_price = NormalizeDouble(g_b_pos_entry_price + InpTpPts * point, digits);
-      else
-         tp_price = NormalizeDouble(g_b_pos_entry_price - InpTpPts * point, digits);
-
-      if(trade.PositionModify(g_b_pos_ticket, g_b_pos_sl_price, tp_price))
-      {
-         g_b_pos_tp_price = tp_price;
-         g_b_pos_tp_armed = true;
-         PrintFormat("[B] TP ARMED at %.*f (pnl was %.1f pts) — broker will close on hit",
-                     digits, tp_price, pnl_pts);
-      }
-      else
-      {
-         PrintFormat("[B] Failed to arm TP: %d (%s)",
-                     trade.ResultRetcode(), trade.ResultRetcodeDescription());
-      }
-   }
-
-   long elapsed = NowMs() - g_b_pos_open_msc;
-   if(elapsed >= InpMaxHoldMs)
-      ClosePosition("TIMEOUT");
 }
 
 //+------------------------------------------------------------------+
@@ -883,11 +1027,18 @@ double MedianOf3(double x, double y, double z)
 //+------------------------------------------------------------------+
 void ExecutorConsensusCheck()
 {
-   if(g_b_pos_open) return;  // already trading
+   if(ActiveSlots() >= g_max_concurrent) return;  // all configured slots busy
 
-   // Cooldown between signals
+   // Cooldown between signals (global, not per-slot)
    if(NowMs() - g_b_last_signal_msc < InpCooldownMs)
       return;
+
+   // Session-window filter (UTC, TimeGMT-based). Off by default.
+   if(!InSessionWindow())
+   {
+      g_skip_session++;
+      return;
+   }
 
    // 1. Read all 3 A heartbeats (any may be missing)
    g_a1_ok = ReadHeartbeatFromFile(HB_FILE_A1, g_a1_msc, g_a1_bid, g_a1_ask,
@@ -1041,7 +1192,6 @@ void ExecutorConsensusCheck()
    // 12. All checks passed — fire!
    g_b_last_signal_msc = NowMs();
    g_b_signals_fired++;
-   g_b_pos_entry_delta = consensus_delta;
 
    PrintFormat("[B] SIGNAL %s consensus=%.1f  d1=%.1f d2=%.1f d3=%.1f  active=%d/3  agree=%d",
                action, consensus_delta, d1, d2, d3, active_count, agree);
@@ -1054,27 +1204,33 @@ void ExecutorConsensusCheck()
       PrintFormat("[B] REVERSED: %s -> %s", action, exec_action);
    }
 
-   // --- Telemetry: capture signal context (g_cyc.active is set later, only if
-   //     the position actually opens, inside OpenPosition). ---
+   // --- Telemetry: stage the signal context into the TARGET slot's cycle
+   //     record. The slot is only activated inside OpenPosition (on a
+   //     successful, SL-protected fill), which recomputes FreeSlotIndex() and
+   //     gets this same index (single-threaded; the ActiveSlots guard above
+   //     guarantees a free slot exists). cyc.active is set there, not here. ---
    //     ab_lag chases the A price in the SIGNAL direction (feed lead, not the
    //     executed trade), so g_lag_is_buy follows `action`, not `exec_action`.
+   int slot = FreeSlotIndex();
+   if(slot < 0) return;   // no room (guard above should prevent this)
+
    double a_mid_target = b_mid + consensus_delta * point;   // A price B must chase to
    long   t_a = 0;                                          // freshest active A timestamp
    if(a1_active && g_a1_msc > t_a) t_a = g_a1_msc;
    if(a2_active && g_a2_msc > t_a) t_a = g_a2_msc;
    if(a3_active && g_a3_msc > t_a) t_a = g_a3_msc;
 
-   ResetCycleTelemetry();
-   g_cyc.t_signal               = g_b_last_signal_msc;
-   g_cyc.direction              = exec_action;              // BUY | SELL (leg actually opened)
-   g_cyc.a_delta_pts            = consensus_delta;
-   g_cyc.a_brokers_agreed       = agree;
-   g_cyc.a_price_at_signal      = a_mid_target;
-   g_cyc.b_price_at_signal      = b_mid;
-   g_cyc.b_spread_pts_at_signal = (b_ask - b_bid) / point;
-   g_cyc.opened_at_iso          = IsoUtcNow();
-   g_cyc.session                = SessionFromGmt();
-   g_cyc.b_atr_m1_pts           = CurrentAtrM1Pts();
+   ResetCycleTelemetry(g_slots[slot].cyc);
+   g_slots[slot].cyc.t_signal               = g_b_last_signal_msc;
+   g_slots[slot].cyc.direction              = exec_action;  // BUY | SELL (leg actually opened)
+   g_slots[slot].cyc.a_delta_pts            = consensus_delta;
+   g_slots[slot].cyc.a_brokers_agreed       = agree;
+   g_slots[slot].cyc.a_price_at_signal      = a_mid_target;
+   g_slots[slot].cyc.b_price_at_signal      = b_mid;
+   g_slots[slot].cyc.b_spread_pts_at_signal = (b_ask - b_bid) / point;
+   g_slots[slot].cyc.opened_at_iso          = IsoUtcNow();
+   g_slots[slot].cyc.session                = SessionFromGmt();
+   g_slots[slot].cyc.b_atr_m1_pts           = CurrentAtrM1Pts();
 
    // ab_lag targets (window is armed in OpenPosition on successful fill).
    g_lag_is_buy = (action == ACTION_BUY);
@@ -1090,7 +1246,7 @@ void ExecutorConsensusCheck()
 //| Transport rules (hot-path safe):                                  |
 //|   - OnTick NEVER calls WebRequest. It only enqueues JSON strings. |
 //|   - WebRequest happens ONLY in OnTimer -> TelemetryFlush, and     |
-//|     ONLY while flat (g_b_pos_open == false — V4.3 has no cycle    |
+//|     ONLY while fully flat (ActiveSlots() == 0 — V4.3 has no cycle |
 //|     state machine, so "flat" is the single-leg equivalent of      |
 //|     V4.4b's CYCLE_IDLE).                                          |
 //|   - A watchers never send HTTP (they only write the heartbeat).   |
@@ -1154,52 +1310,54 @@ string BuildHeartbeatJson(string role, string broker, long login, string symbol,
    return s;
 }
 
-// Build the cycle event JSON from the captured g_cyc state.
+// Build the cycle event JSON from a slot's captured cycle state.
 // V4.3 is single-leg: every hedge_* field is emitted as JSON null, hedge_opened
 // is false, and final_state is always "SINGLE_LEG". exit_reason is sent verbatim
 // (V4.3's own reason string — NOT mapped to V4.4b's enum).
-string BuildCycleJson()
+string BuildCycleJson(int slot)
 {
-   string uid = StringFormat("%s-%I64d", InpDeploymentId, g_cyc.t_signal);
-   long sig2fill = g_cyc.t_leg1_fill - g_cyc.t_signal;
-   long dur      = g_cyc.t_close - g_cyc.t_signal;
-   bool is_win   = (g_cyc.net_pts > 0.0);
+   CycleTelemetry c = g_slots[slot].cyc;   // read-only local copy
+
+   string uid = StringFormat("%s-%I64d", InpDeploymentId, c.t_signal);
+   long sig2fill = c.t_leg1_fill - c.t_signal;
+   long dur      = c.t_close - c.t_signal;
+   bool is_win   = (c.net_pts > 0.0);
 
    string p = "{";
    p += "\"cycle_uid\":\""      + JsonEsc(uid) + "\",";
-   p += "\"direction\":\""      + JsonEsc(g_cyc.direction) + "\",";
-   p += "\"t_signal\":"         + IntegerToString(g_cyc.t_signal) + ",";
-   p += "\"t_leg1_fill\":"      + IntegerToString(g_cyc.t_leg1_fill) + ",";
+   p += "\"direction\":\""      + JsonEsc(c.direction) + "\",";
+   p += "\"t_signal\":"         + IntegerToString(c.t_signal) + ",";
+   p += "\"t_leg1_fill\":"      + IntegerToString(c.t_leg1_fill) + ",";
    p += "\"t_hedge_fill\":null,";
-   p += "\"t_close\":"          + IntegerToString(g_cyc.t_close) + ",";
-   p += "\"opened_at\":\""      + JsonEsc(g_cyc.opened_at_iso) + "\",";
+   p += "\"t_close\":"          + IntegerToString(c.t_close) + ",";
+   p += "\"opened_at\":\""      + JsonEsc(c.opened_at_iso) + "\",";
    p += "\"cycle_duration_ms\":"+ IntegerToString(dur) + ",";
    p += "\"ab_lag_ms\":"        + (g_lag_measured ? IntegerToString(g_lag_ms) : "null") + ",";
    p += "\"signal_to_fill_ms\":"+ IntegerToString(sig2fill) + ",";
-   p += "\"a_delta_pts\":"      + JDbl(g_cyc.a_delta_pts) + ",";
-   p += "\"a_brokers_agreed\":" + IntegerToString(g_cyc.a_brokers_agreed) + ",";
-   p += "\"a_price_at_signal\":"+ JDbl(g_cyc.a_price_at_signal) + ",";
-   p += "\"b_price_at_signal\":"+ JDbl(g_cyc.b_price_at_signal) + ",";
-   p += "\"b_spread_pts_at_signal\":" + JDbl(g_cyc.b_spread_pts_at_signal) + ",";
+   p += "\"a_delta_pts\":"      + JDbl(c.a_delta_pts) + ",";
+   p += "\"a_brokers_agreed\":" + IntegerToString(c.a_brokers_agreed) + ",";
+   p += "\"a_price_at_signal\":"+ JDbl(c.a_price_at_signal) + ",";
+   p += "\"b_price_at_signal\":"+ JDbl(c.b_price_at_signal) + ",";
+   p += "\"b_spread_pts_at_signal\":" + JDbl(c.b_spread_pts_at_signal) + ",";
    p += "\"hedge_opened\":false,";
    p += "\"hedge_trigger_pts_used\":null,";
-   p += "\"leg1_ticket\":"      + IntegerToString((long)g_cyc.leg1_ticket) + ",";
-   p += "\"leg1_expected_price\":" + JDbl(g_cyc.leg1_expected_price) + ",";
-   p += "\"leg1_actual_price\":"   + JDbl(g_cyc.leg1_actual_price) + ",";
-   p += "\"leg1_slippage_pts\":"   + JDbl(g_cyc.leg1_slippage_pts) + ",";
+   p += "\"leg1_ticket\":"      + IntegerToString((long)c.leg1_ticket) + ",";
+   p += "\"leg1_expected_price\":" + JDbl(c.leg1_expected_price) + ",";
+   p += "\"leg1_actual_price\":"   + JDbl(c.leg1_actual_price) + ",";
+   p += "\"leg1_slippage_pts\":"   + JDbl(c.leg1_slippage_pts) + ",";
    p += "\"hedge_ticket\":null,";
    p += "\"hedge_expected_price\":null,";
    p += "\"hedge_actual_price\":null,";
    p += "\"hedge_slippage_pts\":null,";
    p += "\"locked_profit_pts\":null,";
-   p += "\"exit_reason\":\""     + JsonEsc(g_cyc.exit_reason) + "\",";
-   p += "\"final_state\":\""     + JsonEsc(g_cyc.final_state) + "\",";
-   p += "\"gross_pts\":"         + JDbl(g_cyc.gross_pts) + ",";
-   p += "\"net_pts\":"           + JDbl(g_cyc.net_pts) + ",";
-   p += "\"net_money\":"         + JDbl(g_cyc.net_money) + ",";
+   p += "\"exit_reason\":\""     + JsonEsc(c.exit_reason) + "\",";
+   p += "\"final_state\":\""     + JsonEsc(c.final_state) + "\",";
+   p += "\"gross_pts\":"         + JDbl(c.gross_pts) + ",";
+   p += "\"net_pts\":"           + JDbl(c.net_pts) + ",";
+   p += "\"net_money\":"         + JDbl(c.net_money) + ",";
    p += "\"is_win\":"            + (is_win ? "true" : "false") + ",";
-   p += "\"session\":\""         + JsonEsc(g_cyc.session) + "\",";
-   p += "\"b_atr_m1_pts\":"      + JDbl(g_cyc.b_atr_m1_pts);
+   p += "\"session\":\""         + JsonEsc(c.session) + "\",";
+   p += "\"b_atr_m1_pts\":"      + JDbl(c.b_atr_m1_pts);
    p += "}";
 
    string ev = "{";
@@ -1218,22 +1376,22 @@ string BuildCycleJson()
 // event and enqueues it (no HTTP here — flush happens in OnTimer).
 // net_pts must be the SAME value the EA logs for this cycle (passed by the
 // call site), so telemetry never diverges from the EA's own accounting.
-void FinalizeCycleTelemetry(string exit_reason, string final_state, double net_pts)
+void FinalizeCycleTelemetry(int slot, string exit_reason, string final_state, double net_pts)
 {
-   if(!g_cyc.active) return;              // no live cycle / already finalized
-   g_cyc.active = false;
+   if(!g_slots[slot].cyc.active) return;  // no live cycle / already finalized
+   g_slots[slot].cyc.active = false;
 
-   g_cyc.t_close     = NowMs();
-   if(StringLen(exit_reason) > 0) g_cyc.exit_reason = exit_reason;
-   g_cyc.final_state = final_state;       // always "SINGLE_LEG" for V4.3
-   g_cyc.net_pts     = net_pts;
-   g_cyc.gross_pts   = net_pts;           // gross not separately measured (see report)
-   g_cyc.net_money   = PositionNetMoney(g_cyc.leg1_ticket);
+   g_slots[slot].cyc.t_close     = NowMs();
+   if(StringLen(exit_reason) > 0) g_slots[slot].cyc.exit_reason = exit_reason;
+   g_slots[slot].cyc.final_state = final_state;   // always "SINGLE_LEG" for V4.3
+   g_slots[slot].cyc.net_pts     = net_pts;
+   g_slots[slot].cyc.gross_pts   = net_pts;       // gross not separately measured (see report)
+   g_slots[slot].cyc.net_money   = PositionNetMoney(g_slots[slot].cyc.leg1_ticket);
 
    g_lag_active = false;                  // stop measuring for this cycle
 
    if(!InpTelemetryEnabled) return;
-   string js = BuildCycleJson();
+   string js = BuildCycleJson(slot);
    TelemetryEnqueue(js);
    Print("[TEL] cycle enqueued: " + js);
 }
@@ -1277,7 +1435,7 @@ void TelemetryFlush()
 {
    if(!InpTelemetryEnabled)  return;
    if(g_is_watcher)          return;   // A never sends HTTP
-   if(g_b_pos_open)          return;   // never stall mid-position (V4.4b: g_cycle_state != CYCLE_IDLE)
+   if(ActiveSlots() > 0)     return;   // never stall mid-position — only flush while fully flat
    int n = ArraySize(g_tel_q);
    if(n == 0)                return;
 
@@ -1332,8 +1490,15 @@ int OnInit()
    g_is_watcher       = (InpRole != ROLE_B_EXECUTOR);
    g_my_hb_filename   = HeartbeatFileForRole(InpRole);
 
-   trade.SetExpertMagicNumber(MAGIC);
+   g_magic = MAGIC;                       // shared by trade + orphan sweeper
+   trade.SetExpertMagicNumber((ulong)g_magic);
    trade.SetTypeFillingBySymbol(_Symbol);
+
+   // Clamp the concurrent-position count to 1..MAX_SLOTS and log the effective value.
+   g_max_concurrent = InpMaxConcurrent;
+   if(g_max_concurrent < 1)         g_max_concurrent = 1;
+   if(g_max_concurrent > MAX_SLOTS) g_max_concurrent = MAX_SLOTS;
+   for(int i = 0; i < MAX_SLOTS; i++) ClearSlot(i);
 
    string broker = Sanitize(AccountInfoString(ACCOUNT_COMPANY));
    string sym    = Sanitize(_Symbol);
@@ -1373,7 +1538,12 @@ int OnInit()
    // Telemetry setup (B executor only) — ATR handle for b_atr_m1_pts + state.
    if(!g_is_watcher)
    {
-      ResetCycleTelemetry();
+      PrintFormat("[B] InpMaxConcurrent=%d -> effective %d (clamped to 1..%d)",
+                  InpMaxConcurrent, g_max_concurrent, MAX_SLOTS);
+      if(InpUseSessionFilter)
+         PrintFormat("[B] Session filter ON: UTC [%02d:00, %02d:00)%s",
+                     InpSessionStartUTC, InpSessionEndUTC,
+                     (InpSessionStartUTC > InpSessionEndUTC) ? " (wraps midnight)" : "");
       ArrayResize(g_tel_q, 0);
       g_tel_last_hb_ms    = 0;
       g_tel_last_flush_ms = NowMs();
@@ -1471,6 +1641,11 @@ void OnTimer()
 {
    if(g_fh != INVALID_HANDLE) FileFlush(g_fh);
 
+   // ---- Orphan sweep — B executor only, once per tick. Closes any position
+   //      carrying our magic that no slot is tracking (never from OnTick/A). ----
+   if(InpRole == ROLE_B_EXECUTOR)
+      CloseOrphans();
+
    // ---- Telemetry (B executor only) — the ONLY place WebRequest runs ----
    if(!g_is_watcher && InpTelemetryEnabled)
    {
@@ -1482,7 +1657,7 @@ void OnTimer()
       }
       if((tnow - g_tel_last_flush_ms) >= (long)InpTelemetryFlushSec * 1000)
       {
-         TelemetryFlush();   // internally no-ops unless flat (g_b_pos_open == false)
+         TelemetryFlush();   // internally no-ops unless fully flat (ActiveSlots() == 0)
          g_tel_last_flush_ms = tnow;
       }
    }
@@ -1511,18 +1686,20 @@ void OnTimer()
    }
    else
    {
-      // B — full consensus + position status
-      string pos_line = g_b_pos_open
-         ? StringFormat("OPEN %s @ %.*f  pnl=%.1f pts  SL=%.*f  TP=%s  age=%I64d ms",
-                        g_b_pos_action, _Digits, g_b_pos_entry_price,
-                        CurrentPnLPts(),
-                        _Digits, g_b_pos_sl_price,
-                        g_b_pos_tp_armed ? StringFormat("%.*f (ARMED)", _Digits, g_b_pos_tp_price) : "not-armed",
-                        NowMs() - g_b_pos_open_msc)
-         : StringFormat("no position (last close: %s)",
-                        StringLen(g_b_last_close_reason)>0 ? g_b_last_close_reason : "(none)");
-
+      // B — full consensus + slot status.
+      // One line per active slot, plus the slot count and orphan counter.
       long now = NowMs();
+      string pos_block = StringFormat("slots: %d/%d active", ActiveSlots(), g_max_concurrent);
+      for(int si = 0; si < MAX_SLOTS; si++)
+      {
+         if(!g_slots[si].active) continue;
+         double age_s = (now - g_slots[si].open_msc) / 1000.0;
+         pos_block += StringFormat("\n  [%d] %-4s %.*f  SL %.*f  age %.1fs  pnl %+.1f",
+                        si, g_slots[si].action, _Digits, g_slots[si].entry_price,
+                        _Digits, g_slots[si].sl_price, age_s, CurrentPnLPts(si));
+      }
+      pos_block += StringFormat("\norphans closed: %d", g_orphans_closed);
+
       long age1 = now - g_a1_msc, age2 = now - g_a2_msc, age3 = now - g_a3_msc;
       bool a1_act = g_a1_ok && age1 >= 0 && age1 <= InpMaxHeartbeatAgeMs;
       bool a2_act = g_a2_ok && age2 >= 0 && age2 <= InpMaxHeartbeatAgeMs;
@@ -1548,9 +1725,9 @@ void OnTimer()
          : "Vol=off";
 
       string skip_line = StringFormat(
-         "skipped: stale=%I64d nosign=%I64d belowthr=%I64d glitch=%I64d adx=%I64d vol=%I64d spread=%I64d",
+         "skipped: stale=%I64d nosign=%I64d belowthr=%I64d glitch=%I64d adx=%I64d vol=%I64d spread=%I64d session=%I64d",
          g_skip_stale_hb, g_skip_no_sign, g_skip_below_thr, g_skip_glitch,
-         g_skip_adx, g_skip_vol, g_skip_spread);
+         g_skip_adx, g_skip_vol, g_skip_spread, g_skip_session);
 
       role_block = StringFormat(
          "role: B (EXECUTOR V4.3 - multi-broker consensus)\n"
@@ -1558,13 +1735,13 @@ void OnTimer()
          "active brokers: %d/3   signals fired: %I64d   opens: %I64d   closes: %I64d\n"
          "%s\n"
          "%s\n"
-         "position: %s\n"
-         "config: thr=%.0f req=%d/3 maxSpread=%.0f  TP=%.0f/SL=%.0f  timeout=%d ms",
+         "%s\n"
+         "config: thr=%.0f req=%d/3 maxSpread=%.0f  TP=%.0f/SL=%.0f  timeout=%d ms  conc=%d",
          a1_status, a2_status, a3_status,
          active_count, g_b_signals_fired, g_b_exec_count, g_b_close_count,
-         filter_line, skip_line, pos_line,
+         filter_line, skip_line, pos_block,
          InpConsensusThreshold, InpRequireConsensus, InpMaxAgreeSpread,
-         InpTpPts, InpSlPts, InpMaxHoldMs);
+         InpTpPts, InpSlPts, InpMaxHoldMs, g_max_concurrent);
    }
 
    Comment(StringFormat(
@@ -1634,9 +1811,9 @@ void OnDeinit(const int reason)
    {
       summary = StringFormat("Signals: %I64d fired / %I64d opens / %I64d closes\nTotal ticks: %I64d",
                              g_b_signals_fired, g_b_exec_count, g_b_close_count, g_count);
-      PrintFormat("V4.3 [B] stopped. signals=%I64d opens=%I64d closes=%I64d ticks=%I64d pos_open=%s",
+      PrintFormat("V4.3 [B] stopped. signals=%I64d opens=%I64d closes=%I64d ticks=%I64d active_slots=%d",
                   g_b_signals_fired, g_b_exec_count, g_b_close_count, g_count,
-                  g_b_pos_open ? "YES(!)" : "no");
+                  ActiveSlots());
    }
    TG_Shutdown("V4.3", g_tag, summary);
 }
@@ -1664,6 +1841,6 @@ void OnDeinit(const int reason)
 //|  string (TIMEOUT / SL_HIT / TP_HIT / ...), not V4.4b's enum.     |
 //|                                                                  |
 //|  WebRequest is called ONLY from OnTimer -> TelemetryFlush and    |
-//|  ONLY while flat (g_b_pos_open == false). OnTick never touches   |
+//|  ONLY while fully flat (ActiveSlots() == 0). OnTick never touches|
 //|  the network (telemetry side) — it only enqueues.               |
 //+------------------------------------------------------------------+
